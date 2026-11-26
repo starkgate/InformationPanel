@@ -60,6 +60,7 @@ namespace MusicBeePlugin
         private readonly SegmentedLabel propertiesRow;
         private readonly Font propertiesFont;
         private readonly RatingControl ratingControl;
+        private readonly LoveControl loveControl;
         private readonly Label emptyLabel;
         private ContextMenuStrip _fallbackArtworkMenu;
 
@@ -125,6 +126,10 @@ namespace MusicBeePlugin
             ratingControl = new RatingControl();
             ratingControl.RatingChanged += OnRatingChanged;
             Controls.Add(ratingControl);
+
+            loveControl = new LoveControl();
+            // loveControl.LoveChanged += OnLoveChanged;
+            Controls.Add(loveControl);
 
             emptyLabel = new Label
             {
@@ -263,10 +268,11 @@ namespace MusicBeePlugin
                 string[] genres = IsMultiSelection
                     ? CommonValues(file => SplitList(mbApi.Library_GetFileTag(file, MetaDataType.Genre)))
                     : SplitList(GetTag(MetaDataType.Genre));
+                string[] playlists = GetPlaylists();
 
                 for (int i = 0; i < rows.Length; i++)
                 {
-                    var segments = ParseTemplate(PanelSettings.Rows[i], artists, genres, album, albumArtist);
+                    var segments = ParseTemplate(PanelSettings.Rows[i], artists, genres, playlists, album, albumArtist);
                     rows[i].Segments = segments;
                     rows[i].Visible = segments.Any(s => !string.IsNullOrWhiteSpace(s.Text));
                 }
@@ -289,11 +295,16 @@ namespace MusicBeePlugin
                     if (!double.TryParse(ratingRaw, NumberStyles.Float, CultureInfo.CurrentCulture, out double ratingValue))
                         double.TryParse(ratingRaw, NumberStyles.Float, CultureInfo.InvariantCulture, out ratingValue);
                     ratingControl.Rating = Math.Max(0, Math.Min(5, ratingValue));
+                    string loveRaw = GetTag(MetaDataType.RatingLove);
+                    
+                    loveControl.Loved = loveRaw == "L";
+                    loveControl.Banned = loveRaw == "B";
                 }
                 else
                 {
                     ratingControl.Visible = false;
                 }
+                loveControl.Visible = ratingControl.Visible;
 
                 if (PanelSettings.ArtworkPosition != ArtworkPosition.None && SelectionSharesAlbum())
                 {
@@ -469,6 +480,60 @@ namespace MusicBeePlugin
             return SplitArtists(GetTag(MetaDataType.MultiArtist), () => GetTag(MetaDataType.Artist));
         }
 
+        private string[] GetPlaylists()
+        {
+            var playlists = new List<string>();
+        
+            try
+            {
+                if (_files.Length == 0 || !mbApi.Playlist_QueryPlaylists())
+                    return playlists.ToArray();
+        
+                string playlistUrl;
+        
+                while (!string.IsNullOrEmpty(playlistUrl = mbApi.Playlist_QueryGetNextPlaylist()))
+                {
+                    if (mbApi.Playlist_GetType(playlistUrl) == PlaylistFormat.Auto)
+                        continue;
+                    
+                    bool containsAllFiles = true;
+        
+                    foreach (string file in _files)
+                    {
+                        if (!mbApi.Playlist_IsInList(playlistUrl, file))
+                        {
+                            containsAllFiles = false;
+                            break;
+                        }
+                    }
+        
+                    if (!containsAllFiles)
+                        continue;
+        
+                    string name = mbApi.Playlist_GetName(playlistUrl);
+        
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        name = name.TrimEnd('/', '\\');
+                    
+                        int separator = Math.Max(name.LastIndexOf('/'), name.LastIndexOf('\\'));
+                    
+                        if (separator >= 0)
+                            name = name.Substring(separator + 1);
+                    
+                        if (name.Length > 0)
+                            playlists.Add(name);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Error retrieving playlists", ex);
+            }
+        
+            return playlists.ToArray();
+        }
+
         // MultiArtist holds the individual artists separated by '\0'; without
         // it, fall back to the Artist tag split on ';'.
         private static string[] SplitArtists(string multiArtist, Func<string> artist)
@@ -514,7 +579,7 @@ namespace MusicBeePlugin
         // Splits a row template into literal-text and <Tag> segments (see
         // TryResolveTag for the recognized names). Unrecognized tags are left
         // as-is so a typo is visible rather than silently dropped.
-        private List<TrackInfoSegment> ParseTemplate(string template, string[] artists, string[] genres, string album, string albumArtist)
+        private List<TrackInfoSegment> ParseTemplate(string template, string[] artists, string[] genres, string[] playlists, string album, string albumArtist)
         {
             var segments = new List<TrackInfoSegment>();
             if (string.IsNullOrEmpty(template)) return segments;
@@ -525,7 +590,7 @@ namespace MusicBeePlugin
                 if (m.Index > last)
                     segments.Add(TrackInfoSegment.Static(template.Substring(last, m.Index - last)));
 
-                AppendTagSegments(segments, m.Groups[1].Value.Trim(), artists, genres, album, albumArtist);
+                AppendTagSegments(segments, m.Groups[1].Value.Trim(), artists, genres, playlists, album, albumArtist);
 
                 last = m.Index + m.Length;
             }
@@ -536,8 +601,14 @@ namespace MusicBeePlugin
             return segments;
         }
 
-        private void AppendTagSegments(List<TrackInfoSegment> segments, string tagName, string[] artists, string[] genres, string album, string albumArtist)
+        private void AppendTagSegments(List<TrackInfoSegment> segments, string tagName, string[] artists, string[] genres, string[] playlists, string album, string albumArtist)
         {
+            if (string.Equals(tagName, "Playlist", StringComparison.OrdinalIgnoreCase))
+            {
+                AppendStaticMultiValue(segments, playlists);
+                return;
+            }
+
             if (PropertyTags.TryGetValue(tagName, out FilePropertyType property))
             {
                 // file properties aren't filterable tags, so they're plain text
@@ -556,7 +627,7 @@ namespace MusicBeePlugin
             switch (field)
             {
                 case MetaDataType.Artist:
-                    AppendMultiValue(segments, artists, MetaDataType.Artist);
+                    AppendMultiValue(segments, artists, MetaDataType.MultiArtist);
                     return;
 
                 case MetaDataType.Genre:
@@ -575,12 +646,13 @@ namespace MusicBeePlugin
             string value = GetTag(field);
             if (string.IsNullOrEmpty(value)) return;
 
-            // Like the native panel: title is bold, and not a filter link.
-            if (field == MetaDataType.TrackTitle)
+            // Like the native panel: title and track number are bold, not filter links.
+            if (field == MetaDataType.TrackTitle ||
+                field == MetaDataType.TrackNo)
             {
-                var title = TrackInfoSegment.Static(value, dim: false);
-                title.Bold = true;
-                segments.Add(title);
+                var segment = TrackInfoSegment.Static(value, dim: false);
+                segment.Bold = true;
+                segments.Add(segment);
                 return;
             }
 
@@ -726,11 +798,22 @@ namespace MusicBeePlugin
             for (int i = 0; i < values.Length; i++)
             {
                 if (i > 0)
-                    segments.Add(TrackInfoSegment.Static("; "));
+                    segments.Add(TrackInfoSegment.Static(" • "));
 
                 var segment = TrackInfoSegment.Filter(values[i], field, values[i]);
                 segment.WrapBefore = wrap && i > 0;
                 segments.Add(segment);
+            }
+        }
+
+        private static void AppendStaticMultiValue(List<TrackInfoSegment> segments, string[] values)
+        {
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (i > 0)
+                    segments.Add(TrackInfoSegment.Static(" • "));
+        
+                segments.Add(TrackInfoSegment.Static(values[i], dim: false));
             }
         }
 
@@ -786,6 +869,29 @@ namespace MusicBeePlugin
                 Logger.Error("Error setting rating", ex);
             }
         }
+
+        /* private void OnLoveChanged(bool loved)
+        {
+            try
+            {
+                foreach (string file in _files)
+                {
+                    mbApi.Library_SetFileTag(
+                        file,
+                        MetaDataType.RatingLove,
+                        loved ? "L" : "");
+        
+                    mbApi.Library_CommitTagsToFile(file);
+                }
+        
+                mbApi.MB_RefreshPanels();
+                RequestRefresh();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Error updating Loved status", ex);
+            }
+        } */
 
         // ViewShowFullSizeArtwork reads the command dispatcher's third parameter -
         // an IList<Track> - and does tracks[0], so MusicBeeCommandInvoker resolves
@@ -1127,9 +1233,22 @@ namespace MusicBeePlugin
             if (ratingControl.Visible)
             {
                 y += Dpi(3);
-                // native stars start 2px left of the text column
-                ratingControl.Bounds = new Rectangle(new Point(textArea.Left - Dpi(2), y), ratingControl.PreferredStripSize);
+            
+                // Native stars start 2px left of the text column
+                ratingControl.Bounds = new Rectangle(
+                    new Point(textArea.Left - Dpi(2), y),
+                    ratingControl.PreferredStripSize);
+            
                 y += ratingControl.Height + Dpi(4);
+            }
+            
+            if (loveControl.Visible)
+            {
+                loveControl.Bounds = new Rectangle(
+                    ratingControl.Right + Dpi(4),
+                    ratingControl.Top - Dpi(3),
+                    Dpi(18),
+                    Dpi(18));
             }
 
             if (propertiesRow.Visible)
